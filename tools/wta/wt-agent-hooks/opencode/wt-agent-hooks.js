@@ -64,6 +64,8 @@ function enabled() {
 const WtAgentHooks = async ({ directory, resolveSession }) => {
   const rootSessions = new Map()
   const childSessions = new Set()
+  const sessionStates = new Map()
+  let disposed = false
   const active = enabled()
   function emit(topic, sessionID, payload = {}) {
     if (!active || !sessionID) return
@@ -97,7 +99,8 @@ const WtAgentHooks = async ({ directory, resolveSession }) => {
   }
 
   function rememberSession(info) {
-    if (!info?.id) return false
+    if (disposed || !info?.id) return false
+    sessionState(info.id)
     if (info.parentID) {
       childSessions.add(info.id)
       rootSessions.delete(info.id)
@@ -121,26 +124,55 @@ const WtAgentHooks = async ({ directory, resolveSession }) => {
   }
 
   function isRootSession(sessionID) {
-    return rootSessions.has(sessionID) && !childSessions.has(sessionID)
+    return !disposed && rootSessions.has(sessionID) && !childSessions.has(sessionID)
+  }
+
+  function sessionState(sessionID) {
+    let state = sessionStates.get(sessionID)
+    if (!state) {
+      state = {}
+      sessionStates.set(sessionID, state)
+    }
+    return state
+  }
+
+  function isCurrentSession(sessionID, state) {
+    return !disposed && state !== undefined && sessionStates.get(sessionID) === state
   }
 
   async function ensureSession(sessionID) {
-    if (!active || !sessionID || !resolveSession || rootSessions.has(sessionID) || childSessions.has(sessionID)) return
-    try {
-      const info = await resolveSession(sessionID)
-      rememberSession({ ...info, directory: info.location?.directory })
-    } catch (error) {
-      // Do not guess that a resumed session is a root when lookup fails.
-      noteFailure("session.get", error, "session lookup")
+    if (!active || disposed || !sessionID) return
+    const state = sessionState(sessionID)
+    if (!rootSessions.has(sessionID) && !childSessions.has(sessionID)) {
+      // Share one lookup per lifecycle. Deletion removes its token, so a
+      // delayed result cannot recreate a deleted or subsequently reused ID.
+      state.lookup ??= (async () => {
+        try {
+          const info = await resolveSession(sessionID)
+          if (isCurrentSession(sessionID, state)) {
+            rememberSession({ ...info, directory: info.location?.directory })
+          }
+        } catch (error) {
+          if (isCurrentSession(sessionID, state)) noteFailure("session.get", error, "session lookup")
+        }
+      })()
+      await state.lookup
+      if (!isCurrentSession(sessionID, state)) return
+      if (!rootSessions.has(sessionID) && !childSessions.has(sessionID)) {
+        sessionStates.delete(sessionID)
+        return
+      }
     }
+    return state
   }
 
   return {
     "chat.message": async (input) => {
       const sessionID = input.sessionID
       if (!sessionID) return
+      if (disposed) return
 
-      await ensureSession(sessionID)
+      if (resolveSession && !isCurrentSession(sessionID, await ensureSession(sessionID))) return
 
       if (!resolveSession && !childSessions.has(sessionID) && !rootSessions.has(sessionID)) {
         rootSessions.set(sessionID, { cwd: directory, title: "" })
@@ -155,7 +187,7 @@ const WtAgentHooks = async ({ directory, resolveSession }) => {
     },
 
     "tool.execute.before": async (input, output) => {
-      await ensureSession(input.sessionID)
+      if (resolveSession && !isCurrentSession(input.sessionID, await ensureSession(input.sessionID))) return
       if (!isRootSession(input.sessionID)) return
       emit("agent.tool.starting", input.sessionID, {
         tool_name: input.tool,
@@ -164,6 +196,7 @@ const WtAgentHooks = async ({ directory, resolveSession }) => {
     },
 
     event: async ({ event }) => {
+      if (disposed) return
       const properties = event.properties || event.data || {}
 
       switch (event.type) {
@@ -207,6 +240,7 @@ const WtAgentHooks = async ({ directory, resolveSession }) => {
           return
         case "session.deleted": {
           const sessionID = properties.info?.id || properties.sessionID
+          sessionStates.delete(sessionID)
           if (sessionID && isRootSession(sessionID)) {
             emit("agent.session.end", sessionID, { reason: "deleted" })
           }
@@ -235,6 +269,9 @@ const WtAgentHooks = async ({ directory, resolveSession }) => {
     },
 
     dispose: async () => {
+      if (disposed) return
+      disposed = true
+      sessionStates.clear()
       for (const sessionID of rootSessions.keys()) {
         emit("agent.session.end", sessionID, { reason: "OpenCode exited" })
       }
@@ -282,8 +319,8 @@ export default {
 
     return async () => {
       controller.abort()
-      await events
       await hooks.dispose()
+      await events
     }
   },
 }
